@@ -1,0 +1,1094 @@
+"""
+Enhanced Glyph Recognition System
+===================================
+A comprehensive PyTorch implementation for character/glyph recognition using EMNIST dataset.
+
+Features:
+- Residual CNN architecture with improved gradient flow
+- Learning rate finder for optimal hyperparameter selection
+- Early stopping with patience
+- Comprehensive evaluation with confusion matrix and per-class metrics
+- Model checkpointing and recovery
+- Configurable training pipeline
+- Detailed logging and visualization support
+
+Author: Enhanced by Claude
+Date: 2026-02-06
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import os
+import json
+from datetime import datetime
+from tqdm import tqdm
+import argparse
+
+
+# ============================================================================
+# Model Architecture
+# ============================================================================
+
+class ResidualBlock(nn.Module):
+    """Residual block with batch normalization and skip connection."""
+    
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise separable convolution for efficiency."""
+    
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
+                                   stride=stride, padding=padding, groups=in_channels, bias=False)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+    
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return x
+
+
+class EnhancedGlyphCNN(nn.Module):
+    """
+    Enhanced CNN architecture with residual connections and depthwise separable convolutions.
+    
+    Architecture:
+    - Input: 1x32x32 grayscale images
+    - 3 stages with residual blocks
+    - Depthwise separable convolutions for efficiency
+    - Adaptive pooling for flexible input sizes
+    - Dropout and weight normalization for regularization
+    """
+    
+    def __init__(self, num_classes, dropout_rate=0.4, use_residual=True):
+        super(EnhancedGlyphCNN, self).__init__()
+        
+        self.use_residual = use_residual
+        
+        # Initial convolution
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        
+        # Stage 1: 32x32 -> 16x16
+        if use_residual:
+            self.stage1 = nn.Sequential(
+                ResidualBlock(32, 64, stride=2),
+                ResidualBlock(64, 64, stride=1),
+            )
+        else:
+            self.stage1 = nn.Sequential(
+                DepthwiseSeparableConv(32, 64, stride=2),
+                nn.ReLU(inplace=True),
+                DepthwiseSeparableConv(64, 64),
+                nn.ReLU(inplace=True),
+            )
+        
+        # Stage 2: 16x16 -> 8x8
+        if use_residual:
+            self.stage2 = nn.Sequential(
+                ResidualBlock(64, 128, stride=2),
+                ResidualBlock(128, 128, stride=1),
+            )
+        else:
+            self.stage2 = nn.Sequential(
+                DepthwiseSeparableConv(64, 128, stride=2),
+                nn.ReLU(inplace=True),
+                DepthwiseSeparableConv(128, 128),
+                nn.ReLU(inplace=True),
+            )
+        
+        # Stage 3: 8x8 -> 4x4
+        if use_residual:
+            self.stage3 = nn.Sequential(
+                ResidualBlock(128, 256, stride=2),
+                ResidualBlock(256, 256, stride=1),
+            )
+        else:
+            self.stage3 = nn.Sequential(
+                DepthwiseSeparableConv(128, 256, stride=2),
+                nn.ReLU(inplace=True),
+                DepthwiseSeparableConv(256, 256),
+                nn.ReLU(inplace=True),
+            )
+        
+        # Global average pooling
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate * 0.75),  # Less aggressive dropout
+            nn.Linear(512, num_classes),
+        )
+    
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+
+# ============================================================================
+# Learning Rate Finder
+# ============================================================================
+
+class LRFinder:
+    """
+    Learning rate finder using the method from the paper:
+    "Cyclical Learning Rates for Training Neural Networks" by Leslie Smith.
+    """
+    
+    def __init__(self, model, optimizer, criterion, device):
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.device = device
+        
+    def range_test(self, train_loader, start_lr=1e-7, end_lr=10, num_iter=100, 
+                   smooth_f=0.05, diverge_th=5):
+        """
+        Perform learning rate range test.
+        
+        Args:
+            train_loader: Training data loader
+            start_lr: Starting learning rate
+            end_lr: Ending learning rate
+            num_iter: Number of iterations
+            smooth_f: Smoothing factor for loss
+            diverge_th: Threshold for divergence detection
+        
+        Returns:
+            lrs: List of learning rates tested
+            losses: List of corresponding losses
+        """
+        lrs = []
+        losses = []
+        best_loss = float('inf')
+        
+        # Set learning rate
+        lr_schedule = np.logspace(np.log10(start_lr), np.log10(end_lr), num_iter)
+        
+        iterator = iter(train_loader)
+        self.model.train()
+        
+        for lr in lr_schedule:
+            # Update learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            
+            # Get batch
+            try:
+                inputs, targets = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                inputs, targets = next(iterator)
+            
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Record
+            lrs.append(lr)
+            losses.append(loss.item())
+            
+            # Smooth loss
+            if len(losses) > 1:
+                loss_smoothed = smooth_f * loss.item() + (1 - smooth_f) * losses[-2]
+                losses[-1] = loss_smoothed
+            
+            # Check for divergence
+            if loss.item() > diverge_th * best_loss:
+                print(f"Stopping early at LR={lr:.2e}, loss diverged")
+                break
+            
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+        
+        return lrs, losses
+    
+    def plot(self, lrs, losses, save_path=None):
+        """Plot learning rate vs loss."""
+        plt.figure(figsize=(10, 6))
+        plt.plot(lrs, losses)
+        plt.xscale('log')
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss')
+        plt.title('Learning Rate Finder')
+        plt.grid(True)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"LR finder plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close()
+    
+    def suggest_lr(self, lrs, losses):
+        """Suggest optimal learning rate (steepest descent point)."""
+        # Find the point with steepest gradient
+        min_grad_idx = np.argmin(np.gradient(losses))
+        suggested_lr = lrs[min_grad_idx]
+        print(f"Suggested learning rate: {suggested_lr:.2e}")
+        return suggested_lr
+
+
+# ============================================================================
+# Early Stopping
+# ============================================================================
+
+class EarlyStopping:
+    """Early stopping to stop training when validation loss stops improving."""
+    
+    def __init__(self, patience=7, min_delta=0, mode='min', verbose=True):
+        """
+        Args:
+            patience: Number of epochs to wait before stopping
+            min_delta: Minimum change to qualify as improvement
+            mode: 'min' for loss, 'max' for accuracy
+            verbose: Print messages
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, metric):
+        score = -metric if self.mode == 'min' else metric
+        
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+        
+        return self.early_stop
+
+
+# ============================================================================
+# Training Pipeline
+# ============================================================================
+
+class Trainer:
+    """
+    Comprehensive training pipeline with checkpointing, logging, and evaluation.
+    """
+    
+    def __init__(self, model, train_loader, val_loader, test_loader, 
+                 device, config, class_names=None):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.device = device
+        self.config = config
+        self.class_names = class_names
+        
+        # Loss and optimizer
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.AdamW(
+            model.parameters(), 
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay']
+        )
+        
+        # Learning rate scheduler
+        if config['scheduler'] == 'plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', patience=3, factor=0.5, verbose=True
+            )
+        elif config['scheduler'] == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
+            )
+        else:
+            self.scheduler = None
+        
+        # Early stopping
+        self.early_stopping = EarlyStopping(
+            patience=config['early_stopping_patience'],
+            min_delta=0.001,
+            mode='min',
+            verbose=True
+        )
+        
+        # Tracking
+        self.history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'learning_rates': []
+        }
+        self.best_val_acc = 0.0
+        self.best_model_state = None
+        
+        # Create output directory
+        self.output_dir = config.get('output_dir', 'outputs')
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def train_epoch(self):
+        """Train for one epoch."""
+        self.model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        pbar = tqdm(self.train_loader, desc='Training', leave=False)
+        for inputs, targets in pbar:
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            
+            self.optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets)
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            self.optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100. * correct / total:.2f}%'
+            })
+        
+        epoch_loss = running_loss / len(self.train_loader)
+        epoch_acc = 100. * correct / total
+        
+        return epoch_loss, epoch_acc
+    
+    def validate(self):
+        """Validate the model."""
+        self.model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, targets in self.val_loader:
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+                
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        
+        val_loss = running_loss / len(self.val_loader)
+        val_acc = 100. * correct / total
+        
+        return val_loss, val_acc
+    
+    def train(self):
+        """Complete training loop."""
+        print(f"\n{'='*70}")
+        print(f"Starting training for {self.config['num_epochs']} epochs")
+        print(f"{'='*70}\n")
+        
+        for epoch in range(self.config['num_epochs']):
+            # Train
+            train_loss, train_acc = self.train_epoch()
+            
+            # Validate
+            val_loss, val_acc = self.validate()
+            
+            # Update learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.scheduler:
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+            
+            # Record history
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['learning_rates'].append(current_lr)
+            
+            # Print epoch summary
+            print(f'Epoch {epoch+1:3d}/{self.config["num_epochs"]} | '
+                  f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:6.2f}% | '
+                  f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:6.2f}% | '
+                  f'LR: {current_lr:.2e}')
+            
+            # Save best model
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.best_model_state = self.model.state_dict().copy()
+                self.save_checkpoint(epoch, is_best=True)
+                print(f'  ✓ New best model saved! (Val Acc: {val_acc:.2f}%)')
+            
+            # Early stopping
+            if self.early_stopping(val_loss):
+                print(f'\nEarly stopping triggered after {epoch+1} epochs')
+                break
+        
+        # Restore best model
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            print(f'\nRestored best model with validation accuracy: {self.best_val_acc:.2f}%')
+        
+        return self.history
+    
+    def save_checkpoint(self, epoch, is_best=False):
+        """Save model checkpoint."""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_val_acc': self.best_val_acc,
+            'config': self.config,
+            'history': self.history
+        }
+        
+        if is_best:
+            path = os.path.join(self.output_dir, 'best_model.pth')
+            torch.save(checkpoint, path)
+        
+        # Also save latest
+        path = os.path.join(self.output_dir, 'latest_checkpoint.pth')
+        torch.save(checkpoint, path)
+    
+    def plot_history(self):
+        """Plot training history."""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        # Loss plot
+        axes[0].plot(self.history['train_loss'], label='Train Loss', linewidth=2)
+        axes[0].plot(self.history['val_loss'], label='Val Loss', linewidth=2)
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title('Training and Validation Loss')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Accuracy plot
+        axes[1].plot(self.history['train_acc'], label='Train Acc', linewidth=2)
+        axes[1].plot(self.history['val_acc'], label='Val Acc', linewidth=2)
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy (%)')
+        axes[1].set_title('Training and Validation Accuracy')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        # Learning rate plot
+        axes[2].plot(self.history['learning_rates'], linewidth=2, color='green')
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('Learning Rate')
+        axes[2].set_title('Learning Rate Schedule')
+        axes[2].set_yscale('log')
+        axes[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        save_path = os.path.join(self.output_dir, 'training_history.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'\nTraining history plot saved to {save_path}')
+        plt.close()
+
+
+# ============================================================================
+# Evaluation and Analysis
+# ============================================================================
+
+class Evaluator:
+    """Comprehensive model evaluation with metrics and visualizations."""
+    
+    def __init__(self, model, test_loader, device, class_names=None, output_dir='outputs'):
+        self.model = model
+        self.test_loader = test_loader
+        self.device = device
+        self.class_names = class_names
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def evaluate(self):
+        """Evaluate model on test set."""
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+        correct = 0
+        total = 0
+        
+        print("\nEvaluating on test set...")
+        with torch.no_grad():
+            for inputs, targets in tqdm(self.test_loader, desc='Testing'):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                outputs = self.model(inputs)
+                _, predicted = outputs.max(1)
+                
+                all_preds.extend(predicted.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+                
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        
+        accuracy = 100. * correct / total
+        print(f'\nTest Accuracy: {accuracy:.2f}%')
+        
+        return np.array(all_preds), np.array(all_targets), accuracy
+    
+    def plot_confusion_matrix(self, y_true, y_pred, normalize=True):
+        """Plot confusion matrix."""
+        cm = confusion_matrix(y_true, y_pred)
+        
+        if normalize:
+            cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+        plt.figure(figsize=(12, 10))
+        
+        # For large number of classes, use a smaller font
+        fontsize = max(6, 12 - len(np.unique(y_true)) // 10)
+        
+        sns.heatmap(cm, annot=False, fmt='.2f' if normalize else 'd', 
+                    cmap='Blues', cbar_kws={'label': 'Proportion' if normalize else 'Count'})
+        
+        plt.title('Confusion Matrix' + (' (Normalized)' if normalize else ''))
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        
+        # Set tick labels if class names available
+        if self.class_names is not None and len(self.class_names) < 50:
+            plt.yticks(np.arange(len(self.class_names)) + 0.5, self.class_names, 
+                      rotation=0, fontsize=fontsize)
+            plt.xticks(np.arange(len(self.class_names)) + 0.5, self.class_names, 
+                      rotation=90, fontsize=fontsize)
+        
+        plt.tight_layout()
+        suffix = '_normalized' if normalize else ''
+        save_path = os.path.join(self.output_dir, f'confusion_matrix{suffix}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Confusion matrix saved to {save_path}')
+        plt.close()
+    
+    def generate_classification_report(self, y_true, y_pred):
+        """Generate and save classification report."""
+        target_names = self.class_names if self.class_names else None
+        report = classification_report(y_true, y_pred, target_names=target_names, 
+                                      digits=4, zero_division=0)
+        
+        print("\n" + "="*70)
+        print("CLASSIFICATION REPORT")
+        print("="*70)
+        print(report)
+        
+        # Save to file
+        report_path = os.path.join(self.output_dir, 'classification_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(report)
+        print(f'\nClassification report saved to {report_path}')
+        
+        return report
+    
+    def analyze_misclassifications(self, y_true, y_pred, top_k=10):
+        """Analyze most common misclassifications."""
+        # Get misclassification pairs
+        misclass_pairs = []
+        for true_label, pred_label in zip(y_true, y_pred):
+            if true_label != pred_label:
+                misclass_pairs.append((true_label, pred_label))
+        
+        # Count occurrences
+        from collections import Counter
+        pair_counts = Counter(misclass_pairs)
+        most_common = pair_counts.most_common(top_k)
+        
+        print(f"\n{'='*70}")
+        print(f"Top {top_k} Most Common Misclassifications")
+        print(f"{'='*70}")
+        
+        for (true_label, pred_label), count in most_common:
+            true_name = self.class_names[true_label] if self.class_names else str(true_label)
+            pred_name = self.class_names[pred_label] if self.class_names else str(pred_label)
+            print(f"True: {true_name:15s} → Predicted: {pred_name:15s} | Count: {count:4d}")
+        
+        # Save to file
+        report_path = os.path.join(self.output_dir, 'misclassification_analysis.txt')
+        with open(report_path, 'w') as f:
+            f.write(f"Top {top_k} Most Common Misclassifications\n")
+            f.write("="*70 + "\n")
+            for (true_label, pred_label), count in most_common:
+                true_name = self.class_names[true_label] if self.class_names else str(true_label)
+                pred_name = self.class_names[pred_label] if self.class_names else str(pred_label)
+                f.write(f"True: {true_name:15s} → Predicted: {pred_name:15s} | Count: {count:4d}\n")
+        
+        print(f'\nMisclassification analysis saved to {report_path}')
+    
+    def compute_per_class_accuracy(self, y_true, y_pred):
+        """Compute and visualize per-class accuracy."""
+        from sklearn.metrics import accuracy_score
+        
+        classes = np.unique(y_true)
+        per_class_acc = []
+        
+        for cls in classes:
+            mask = y_true == cls
+            if mask.sum() > 0:
+                acc = accuracy_score(y_true[mask], y_pred[mask])
+                per_class_acc.append((cls, acc * 100))
+        
+        # Sort by accuracy
+        per_class_acc.sort(key=lambda x: x[1])
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=(12, max(6, len(classes) * 0.2)))
+        
+        classes_sorted = [x[0] for x in per_class_acc]
+        accs = [x[1] for x in per_class_acc]
+        
+        colors = ['red' if acc < 70 else 'orange' if acc < 85 else 'green' for acc in accs]
+        
+        y_pos = np.arange(len(classes_sorted))
+        ax.barh(y_pos, accs, color=colors, alpha=0.7)
+        
+        if self.class_names is not None:
+            labels = [self.class_names[c] for c in classes_sorted]
+        else:
+            labels = [str(c) for c in classes_sorted]
+        
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel('Accuracy (%)')
+        ax.set_title('Per-Class Accuracy')
+        ax.axvline(x=np.mean(accs), color='blue', linestyle='--', 
+                   label=f'Mean: {np.mean(accs):.2f}%')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='x')
+        
+        plt.tight_layout()
+        save_path = os.path.join(self.output_dir, 'per_class_accuracy.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Per-class accuracy plot saved to {save_path}')
+        plt.close()
+        
+        # Save worst performers
+        print(f"\n{'='*70}")
+        print("Worst Performing Classes (Bottom 10)")
+        print(f"{'='*70}")
+        for cls, acc in per_class_acc[:10]:
+            class_name = self.class_names[cls] if self.class_names else str(cls)
+            print(f"Class {class_name:15s}: {acc:6.2f}%")
+
+
+# ============================================================================
+# Data Loading
+# ============================================================================
+
+def get_data_loaders(config):
+    """
+    Create data loaders with proper transforms and augmentation.
+    
+    Args:
+        config: Configuration dictionary
+    
+    Returns:
+        train_loader, val_loader, test_loader, num_classes, class_names
+    """
+    # Compute dataset statistics if needed
+    if config.get('compute_stats', False):
+        print("Computing dataset statistics...")
+        temp_dataset = torchvision.datasets.EMNIST(
+            root='./data', split=config['emnist_split'], train=True, 
+            download=True, transform=transforms.ToTensor()
+        )
+        loader = DataLoader(temp_dataset, batch_size=1000, num_workers=2)
+        mean = 0.
+        std = 0.
+        for images, _ in tqdm(loader, desc='Computing stats'):
+            batch_samples = images.size(0)
+            images = images.view(batch_samples, images.size(1), -1)
+            mean += images.mean(2).sum(0)
+            std += images.std(2).sum(0)
+        mean /= len(loader.dataset)
+        std /= len(loader.dataset)
+        print(f"Dataset mean: {mean.item():.4f}, std: {std.item():.4f}")
+    else:
+        # Use EMNIST/MNIST standard statistics
+        mean, std = 0.1307, 0.3081
+    
+    # Training transforms with augmentation
+    train_transform = transforms.Compose([
+        transforms.Pad(2),  # 28x28 -> 32x32
+        transforms.RandomRotation(config.get('rotation_degree', 15)),
+        transforms.RandomAffine(
+            degrees=config.get('affine_degree', 10), 
+            translate=(config.get('translate', 0.08), config.get('translate', 0.08)),
+            scale=(config.get('scale_min', 0.9), config.get('scale_max', 1.1))
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize((mean,), (std,))
+    ])
+    
+    # Validation/Test transforms (no augmentation)
+    test_transform = transforms.Compose([
+        transforms.Pad(2),
+        transforms.ToTensor(),
+        transforms.Normalize((mean,), (std,))
+    ])
+    
+    # Load datasets
+    train_dataset = torchvision.datasets.EMNIST(
+        root='./data', split=config['emnist_split'], train=True, 
+        download=True, transform=train_transform
+    )
+    
+    test_dataset = torchvision.datasets.EMNIST(
+        root='./data', split=config['emnist_split'], train=False, 
+        download=True, transform=test_transform
+    )
+    
+    # Create validation split
+    torch.manual_seed(config.get('seed', 42))
+    val_size = int(len(train_dataset) * config.get('val_split', 0.1))
+    train_size = len(train_dataset) - val_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_subset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        num_workers=config.get('num_workers', 2),
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    val_loader = DataLoader(
+        val_subset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=config.get('num_workers', 2),
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=config.get('num_workers', 2),
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    num_classes = len(train_dataset.classes)
+    class_names = [str(c) for c in train_dataset.classes]
+    
+    print(f"\nDataset: EMNIST-{config['emnist_split']}")
+    print(f"Number of classes: {num_classes}")
+    print(f"Training samples: {train_size}")
+    print(f"Validation samples: {val_size}")
+    print(f"Test samples: {len(test_dataset)}")
+    
+    return train_loader, val_loader, test_loader, num_classes, class_names
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+def get_default_config():
+    """Get default configuration."""
+    return {
+        # Data
+        'emnist_split': 'balanced',  # 'balanced' (47 classes) or 'byclass' (62 classes)
+        'batch_size': 128,
+        'num_workers': 2,
+        'val_split': 0.1,
+        'seed': 42,
+        
+        # Data augmentation
+        'rotation_degree': 15,
+        'affine_degree': 10,
+        'translate': 0.08,
+        'scale_min': 0.9,
+        'scale_max': 1.1,
+        
+        # Model
+        'use_residual': True,
+        'dropout_rate': 0.4,
+        
+        # Training
+        'num_epochs': 50,
+        'learning_rate': 0.001,
+        'weight_decay': 1e-4,
+        'scheduler': 'cosine',  # 'plateau', 'cosine', or None
+        'early_stopping_patience': 10,
+        
+        # Misc
+        'output_dir': 'outputs',
+        'compute_stats': False,
+        'use_lr_finder': False,
+        'run_full_evaluation': True,
+    }
+
+
+def save_config(config, output_dir):
+    """Save configuration to JSON file."""
+    config_path = os.path.join(output_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    print(f"Configuration saved to {config_path}")
+
+
+# ============================================================================
+# Main Training Script
+# ============================================================================
+
+def main(args):
+    """Main training function."""
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n{'='*70}")
+    print(f"Enhanced Glyph Recognition System")
+    print(f"{'='*70}")
+    print(f"Device: {device}")
+    print(f"PyTorch version: {torch.__version__}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
+    # Get configuration
+    config = get_default_config()
+    
+    # Override with command line arguments
+    if args.split:
+        config['emnist_split'] = args.split
+    if args.batch_size:
+        config['batch_size'] = args.batch_size
+    if args.epochs:
+        config['num_epochs'] = args.epochs
+    if args.lr:
+        config['learning_rate'] = args.lr
+    if args.output_dir:
+        config['output_dir'] = args.output_dir
+    
+    config['use_lr_finder'] = args.lr_finder
+    config['run_full_evaluation'] = not args.skip_eval
+    config['seed'] = args.seed
+    
+    # Create output directory
+    os.makedirs(config['output_dir'], exist_ok=True)
+    
+    # Save configuration
+    save_config(config, config['output_dir'])
+    
+    # Load data
+    print(f"\n{'='*70}")
+    print("Loading Data")
+    print(f"{'='*70}")
+    train_loader, val_loader, test_loader, num_classes, class_names = get_data_loaders(config)
+    
+    # Create model
+    print(f"\n{'='*70}")
+    print("Building Model")
+    print(f"{'='*70}")
+    model = EnhancedGlyphCNN(
+        num_classes=num_classes,
+        dropout_rate=config['dropout_rate'],
+        use_residual=config['use_residual']
+    )
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"\nModel architecture:")
+    print(model)
+    
+    # Learning rate finder (optional)
+    if config['use_lr_finder']:
+        print(f"\n{'='*70}")
+        print("Running Learning Rate Finder")
+        print(f"{'='*70}")
+        
+        # Create a temporary model and optimizer for LR finding
+        temp_model = EnhancedGlyphCNN(num_classes=num_classes).to(device)
+        temp_optimizer = optim.Adam(temp_model.parameters(), lr=1e-7)
+        criterion = nn.CrossEntropyLoss()
+        
+        lr_finder = LRFinder(temp_model, temp_optimizer, criterion, device)
+        lrs, losses = lr_finder.range_test(train_loader, start_lr=1e-7, end_lr=10, num_iter=100)
+        
+        # Plot and suggest LR
+        lr_finder.plot(lrs, losses, save_path=os.path.join(config['output_dir'], 'lr_finder.png'))
+        suggested_lr = lr_finder.suggest_lr(lrs, losses)
+        
+        # Update config with suggested LR
+        if input(f"Use suggested LR {suggested_lr:.2e}? (y/n): ").lower() == 'y':
+            config['learning_rate'] = suggested_lr
+            print(f"Updated learning rate to {suggested_lr:.2e}")
+        
+        # Clean up
+        del temp_model, temp_optimizer, lr_finder
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Training
+    print(f"\n{'='*70}")
+    print("Initializing Training")
+    print(f"{'='*70}")
+    
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        device=device,
+        config=config,
+        class_names=class_names
+    )
+    
+    # Train the model
+    history = trainer.train()
+    
+    # Plot training history
+    trainer.plot_history()
+    
+    # Evaluation
+    if config['run_full_evaluation']:
+        print(f"\n{'='*70}")
+        print("Running Comprehensive Evaluation")
+        print(f"{'='*70}")
+        
+        evaluator = Evaluator(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            class_names=class_names,
+            output_dir=config['output_dir']
+        )
+        
+        # Get predictions
+        y_pred, y_true, test_acc = evaluator.evaluate()
+        
+        # Generate reports and visualizations
+        evaluator.plot_confusion_matrix(y_true, y_pred, normalize=True)
+        evaluator.plot_confusion_matrix(y_true, y_pred, normalize=False)
+        evaluator.generate_classification_report(y_true, y_pred)
+        evaluator.analyze_misclassifications(y_true, y_pred, top_k=10)
+        evaluator.compute_per_class_accuracy(y_true, y_pred)
+    
+    # Final summary
+    print(f"\n{'='*70}")
+    print("Training Complete!")
+    print(f"{'='*70}")
+    print(f"Best validation accuracy: {trainer.best_val_acc:.2f}%")
+    if config['run_full_evaluation']:
+        print(f"Final test accuracy: {test_acc:.2f}%")
+    print(f"\nAll outputs saved to: {config['output_dir']}")
+    print(f"  - Best model: {os.path.join(config['output_dir'], 'best_model.pth')}")
+    print(f"  - Training history: {os.path.join(config['output_dir'], 'training_history.png')}")
+    if config['run_full_evaluation']:
+        print(f"  - Confusion matrix: {os.path.join(config['output_dir'], 'confusion_matrix_normalized.png')}")
+        print(f"  - Classification report: {os.path.join(config['output_dir'], 'classification_report.txt')}")
+    print(f"{'='*70}\n")
+
+
+# ============================================================================
+# Command Line Interface
+# ============================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Enhanced Glyph Recognition System',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Data arguments
+    parser.add_argument('--split', type=str, choices=['balanced', 'byclass'], 
+                       default='balanced',
+                       help='EMNIST split to use (balanced=47 classes, byclass=62 classes)')
+    parser.add_argument('--batch-size', type=int, default=128,
+                       help='Batch size for training')
+    
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of epochs to train')
+    parser.add_argument('--lr', type=float, default=0.001,
+                       help='Initial learning rate')
+    parser.add_argument('--lr-finder', action='store_true',
+                       help='Run learning rate finder before training')
+    
+    # Misc arguments
+    parser.add_argument('--output-dir', type=str, default='outputs',
+                       help='Directory to save outputs')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    parser.add_argument('--skip-eval', action='store_true',
+                       help='Skip full evaluation after training')
+    
+    args = parser.parse_args()
+    
+    # Run main training
+    main(args)
