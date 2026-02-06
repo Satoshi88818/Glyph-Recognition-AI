@@ -1,0 +1,208 @@
+Quick Start Guide
+
+Installation (2 minutes)
+
+Install dependencies:
+
+pip install -r requirements.txt 
+
+Verify installation:
+
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')" 
+
+Basic Training (5 minutes to start)
+
+Option 1: Default Settings (Recommended for first run)
+
+python enhanced_glyph_recognition.py 
+
+This will:
+
+Download EMNIST dataset automatically (~500MB)
+
+Train on 47 character classes
+
+Run for 50 epochs
+
+Save results to outputs/ directory
+
+Option 2: Quick Test (1-2 minutes)
+
+python enhanced_glyph_recognition.py --epochs 5 --skip-eval 
+
+Option 3: With Learning Rate Finder
+
+python enhanced_glyph_recognition.py --lr-finder 
+
+Understanding the Output
+
+After training completes, check the outputs/ directory:
+
+outputs/ ├── best_model.pth # Your trained model ├── config.json # Training settings used ├── training_history.png # Loss/accuracy graphs ├── confusion_matrix.png # Model error patterns ├── classification_report.txt # Detailed metrics └── per_class_accuracy.png # Performance by class 
+
+Using Your Trained Model
+
+Predict on a single image:
+
+python inference.py --model outputs/best_model.pth --image my_image.png 
+
+Predict on multiple images:
+
+python inference.py --model outputs/best_model.pth --batch ./my_images/ 
+
+Get visualization:
+
+python inference.py --model outputs/best_model.pth --image my_image.png --visualize 
+
+Common Workflows
+
+1. Train and Evaluate
+
+# Train with all features python enhanced_glyph_recognition.py --lr-finder # Results will be in outputs/ directory 
+
+2. Experiment with Different Settings
+
+# Try 62 classes instead of 47 python enhanced_glyph_recognition.py --split byclass --output-dir experiment_62_classes # Try different learning rate python enhanced_glyph_recognition.py --lr 0.0005 --output-dir experiment_low_lr # Longer training python enhanced_glyph_recognition.py --epochs 100 --output-dir experiment_long 
+
+3. Resume Training (if interrupted)
+
+# In Python script or notebook import torch from enhanced_glyph_recognition import EnhancedGlyphCNN # Load checkpoint checkpoint = torch.load('outputs/latest_checkpoint.pth') model = EnhancedGlyphCNN(num_classes=47) model.load_state_dict(checkpoint['model_state_dict']) # Continue training... 
+
+Expected Performance
+
+EMNIST-Balanced (47 classes) - Default
+
+Training time: 1.5-2.5 hours on GPU, 6-8 hours on CPU
+
+Expected accuracy: 88-91% on test set
+
+Model size: ~3.5 MB
+
+EMNIST-ByClass (62 classes)
+
+Training time: Similar to balanced
+
+Expected accuracy: 85-87% on test set
+
+Model size: ~3.8 MB
+
+Tips for Best Results
+
+Use GPU if available: 10-15x faster than CPU
+
+# Check GPU availability python -c "import torch; print(torch.cuda.is_available())" 
+
+Use Learning Rate Finder: Finds optimal LR automatically
+
+python enhanced_glyph_recognition.py --lr-finder 
+
+Monitor training: Watch the training logs for:
+
+Loss should decrease steadily
+
+Validation accuracy should increase
+
+Early stopping will trigger if overfitting
+
+Check results: Look at:
+
+confusion_matrix.png - See which classes are confused
+
+per_class_accuracy.png - Identify weak classes
+
+misclassification_analysis.txt - Common mistakes
+
+Troubleshooting
+
+Issue: CUDA out of memory
+
+Solution: Reduce batch size
+
+python enhanced_glyph_recognition.py --batch-size 64 
+
+Issue: Training too slow on CPU
+
+Solutions:
+
+Reduce epochs for testing:
+
+python enhanced_glyph_recognition.py --epochs 10 
+
+Use smaller batch size to free up memory:
+
+python enhanced_glyph_recognition.py --batch-size 64 
+
+Issue: Model not improving
+
+Solutions:
+
+Run learning rate finder:
+
+python enhanced_glyph_recognition.py --lr-finder 
+
+Check data augmentation (in code):
+
+Too much rotation can hurt performance
+
+Adjust in get_default_config()
+
+Try different scheduler:
+
+Edit config['scheduler'] in code
+
+Options: 'cosine', 'plateau', or None
+
+Issue: Import errors
+
+Solution: Make sure all dependencies are installed
+
+pip install -r requirements.txt --upgrade 
+
+Next Steps
+
+1. Customize for Your Dataset
+
+Edit get_data_loaders() in enhanced_glyph_recognition.py to load your data.
+
+2. Experiment with Architecture
+
+Modify EnhancedGlyphCNN class to try different architectures:
+
+Add more residual blocks
+
+Change number of channels
+
+Adjust dropout rates
+
+3. Advanced Training
+
+Implement data augmentation strategies
+
+Try different optimizers (SGD, RAdam)
+
+Add mixup or cutout augmentation
+
+4. Deployment
+
+Use inference.py as a starting point for:
+
+Web API (Flask, FastAPI)
+
+Mobile deployment (PyTorch Mobile)
+
+ONNX export for other frameworks
+
+Getting Help
+
+Check the README: Full documentation in README.md
+
+Review the code: Well-commented for learning
+
+Experiment: Try different settings and observe results
+
+Example Session
+
+# Step 1: Install pip install -r requirements.txt # Step 2: Quick test (5 epochs) python enhanced_glyph_recognition.py --epochs 5 --skip-eval # Step 3: Full training with LR finder python enhanced_glyph_recognition.py --lr-finder # Step 4: Check results ls -lh outputs/ # Step 5: Use model for inference python inference.py --model outputs/best_model.pth --image test.png --visualize # Step 6: Experiment with settings python enhanced_glyph_recognition.py --split byclass --epochs 100 --output-dir exp_byclass 
+
+Enjoy training! 🚀
+
