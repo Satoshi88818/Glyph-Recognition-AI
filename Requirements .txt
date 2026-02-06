@@ -1,0 +1,23 @@
+# Core Dependencies
+torch>=1.10.0
+torchvision>=0.11.0
+
+# Data Processing & Visualization
+numpy>=1.21.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# Metrics & Evaluation
+scikit-learn>=1.0.0
+
+# Progress Tracking
+tqdm>=4.62.0
+
+# Optional: For faster data loading
+# pillow>=8.3.0
+# opencv-python>=4.5.0
+
+# Development (Optional)
+# jupyter>=1.0.0
+# tensorboard>=2.7.0
+# pytest>=6.2.0
