@@ -1,0 +1,285 @@
+"""
+Inference Script for Enhanced Glyph Recognition
+================================================
+Use a trained model to make predictions on new images.
+
+Usage:
+    python inference.py --model best_model.pth --image path/to/image.png
+    python inference.py --model best_model.pth --batch path/to/images/
+"""
+
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+import argparse
+import os
+import json
+from pathlib import Path
+
+# Import model architecture (assuming it's in the same directory)
+from enhanced_glyph_recognition import EnhancedGlyphCNN
+
+
+class GlyphPredictor:
+    """Inference wrapper for glyph recognition."""
+    
+    def __init__(self, model_path, device=None):
+        """
+        Initialize predictor with trained model.
+        
+        Args:
+            model_path: Path to saved model checkpoint (.pth file)
+            device: torch device (cuda/cpu), auto-detected if None
+        """
+        self.device = device if device else torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        
+        # Load checkpoint
+        checkpoint = torch.load(model_path, map_location=self.device)
+        
+        # Get config and class info
+        if 'config' in checkpoint:
+            self.config = checkpoint['config']
+            # Infer number of classes from model state dict
+            classifier_weight = checkpoint['model_state_dict']['classifier.3.weight']
+            self.num_classes = classifier_weight.shape[0]
+        else:
+            # Fallback if config not in checkpoint
+            print("Warning: Config not found in checkpoint, using defaults")
+            self.num_classes = 47  # EMNIST balanced default
+            self.config = {}
+        
+        # Initialize model
+        self.model = EnhancedGlyphCNN(
+            num_classes=self.num_classes,
+            dropout_rate=self.config.get('dropout_rate', 0.4),
+            use_residual=self.config.get('use_residual', True)
+        )
+        
+        # Load weights
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Setup transforms (same as test/inference)
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),  # Ensure grayscale
+            transforms.Resize((28, 28)),  # EMNIST size
+            transforms.Pad(2),  # Pad to 32x32
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))  # EMNIST stats
+        ])
+        
+        print(f"Model loaded successfully!")
+        print(f"Device: {self.device}")
+        print(f"Number of classes: {self.num_classes}")
+        if 'best_val_acc' in checkpoint:
+            print(f"Model validation accuracy: {checkpoint['best_val_acc']:.2f}%")
+    
+    def predict_image(self, image_path, top_k=5):
+        """
+        Predict class for a single image.
+        
+        Args:
+            image_path: Path to image file
+            top_k: Return top-k predictions
+        
+        Returns:
+            predictions: List of (class_idx, confidence) tuples
+        """
+        # Load and preprocess image
+        image = Image.open(image_path).convert('L')  # Convert to grayscale
+        input_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        
+        # Inference
+        with torch.no_grad():
+            outputs = self.model(input_tensor)
+            probabilities = F.softmax(outputs, dim=1)
+        
+        # Get top-k predictions
+        top_probs, top_indices = torch.topk(probabilities[0], k=min(top_k, self.num_classes))
+        
+        predictions = [
+            (idx.item(), prob.item())
+            for idx, prob in zip(top_indices, top_probs)
+        ]
+        
+        return predictions
+    
+    def predict_batch(self, image_paths, batch_size=32):
+        """
+        Predict classes for multiple images.
+        
+        Args:
+            image_paths: List of image file paths
+            batch_size: Batch size for processing
+        
+        Returns:
+            all_predictions: List of predictions for each image
+        """
+        all_predictions = []
+        
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            
+            # Load and preprocess batch
+            batch_tensors = []
+            for path in batch_paths:
+                image = Image.open(path).convert('L')
+                tensor = self.transform(image)
+                batch_tensors.append(tensor)
+            
+            batch_input = torch.stack(batch_tensors).to(self.device)
+            
+            # Inference
+            with torch.no_grad():
+                outputs = self.model(batch_input)
+                probabilities = F.softmax(outputs, dim=1)
+            
+            # Get predictions
+            _, predicted_classes = torch.max(probabilities, 1)
+            confidences = torch.max(probabilities, 1)[0]
+            
+            for j, (cls, conf) in enumerate(zip(predicted_classes, confidences)):
+                all_predictions.append({
+                    'image': batch_paths[j],
+                    'class': cls.item(),
+                    'confidence': conf.item()
+                })
+        
+        return all_predictions
+    
+    def visualize_prediction(self, image_path, save_path=None):
+        """
+        Visualize image with top predictions.
+        
+        Args:
+            image_path: Path to image file
+            save_path: Optional path to save visualization
+        """
+        import matplotlib.pyplot as plt
+        
+        # Get predictions
+        predictions = self.predict_image(image_path, top_k=5)
+        
+        # Load original image
+        image = Image.open(image_path).convert('L')
+        
+        # Create visualization
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # Show image
+        ax1.imshow(image, cmap='gray')
+        ax1.axis('off')
+        ax1.set_title('Input Image')
+        
+        # Show predictions
+        classes = [str(p[0]) for p in predictions]
+        confidences = [p[1] * 100 for p in predictions]
+        
+        colors = ['green' if i == 0 else 'gray' for i in range(len(classes))]
+        y_pos = np.arange(len(classes))
+        
+        ax2.barh(y_pos, confidences, color=colors, alpha=0.7)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels([f'Class {c}' for c in classes])
+        ax2.set_xlabel('Confidence (%)')
+        ax2.set_title('Top-5 Predictions')
+        ax2.set_xlim([0, 100])
+        
+        # Add confidence values
+        for i, v in enumerate(confidences):
+            ax2.text(v + 2, i, f'{v:.2f}%', va='center')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Visualization saved to {save_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Inference for Enhanced Glyph Recognition')
+    parser.add_argument('--model', type=str, required=True,
+                       help='Path to trained model checkpoint (.pth)')
+    parser.add_argument('--image', type=str,
+                       help='Path to single image for prediction')
+    parser.add_argument('--batch', type=str,
+                       help='Path to directory containing multiple images')
+    parser.add_argument('--output', type=str, default='predictions.json',
+                       help='Output file for batch predictions')
+    parser.add_argument('--visualize', action='store_true',
+                       help='Create visualization of predictions')
+    parser.add_argument('--top-k', type=int, default=5,
+                       help='Number of top predictions to show')
+    
+    args = parser.parse_args()
+    
+    # Initialize predictor
+    print(f"Loading model from {args.model}...")
+    predictor = GlyphPredictor(args.model)
+    
+    # Single image prediction
+    if args.image:
+        print(f"\nPredicting for image: {args.image}")
+        predictions = predictor.predict_image(args.image, top_k=args.top_k)
+        
+        print(f"\nTop-{args.top_k} Predictions:")
+        print("-" * 40)
+        for i, (class_idx, confidence) in enumerate(predictions, 1):
+            print(f"{i}. Class {class_idx}: {confidence*100:.2f}%")
+        
+        if args.visualize:
+            vis_path = args.image.replace('.', '_prediction.')
+            if not vis_path.endswith('.png'):
+                vis_path = vis_path.rsplit('.', 1)[0] + '.png'
+            predictor.visualize_prediction(args.image, save_path=vis_path)
+    
+    # Batch prediction
+    elif args.batch:
+        print(f"\nProcessing images in directory: {args.batch}")
+        
+        # Get all image files
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
+        image_paths = [
+            str(p) for p in Path(args.batch).rglob('*')
+            if p.suffix.lower() in image_extensions
+        ]
+        
+        if not image_paths:
+            print("No images found in directory!")
+            return
+        
+        print(f"Found {len(image_paths)} images")
+        
+        # Predict
+        predictions = predictor.predict_batch(image_paths)
+        
+        # Save results
+        with open(args.output, 'w') as f:
+            json.dump(predictions, f, indent=2)
+        
+        print(f"\nPredictions saved to {args.output}")
+        
+        # Print summary
+        print("\nSummary:")
+        print("-" * 40)
+        from collections import Counter
+        class_counts = Counter([p['class'] for p in predictions])
+        for class_idx, count in class_counts.most_common(10):
+            print(f"Class {class_idx}: {count} images")
+    
+    else:
+        print("Please provide either --image or --batch argument")
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
