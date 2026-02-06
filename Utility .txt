@@ -1,0 +1,504 @@
+"""
+Model Analysis and Comparison Utilities
+========================================
+Tools for analyzing trained models, comparing experiments, and visualizing results.
+
+Usage:
+    python model_utils.py --analyze outputs/best_model.pth
+    python model_utils.py --compare exp1/best_model.pth exp2/best_model.pth
+    python model_utils.py --export outputs/best_model.pth --format onnx
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+import argparse
+from pathlib import Path
+from collections import OrderedDict
+import time
+
+from enhanced_glyph_recognition import EnhancedGlyphCNN
+
+
+class ModelAnalyzer:
+    """Analyze and compare trained models."""
+    
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self.checkpoint = torch.load(model_path, map_location='cpu')
+        
+        # Extract info
+        self.config = self.checkpoint.get('config', {})
+        self.history = self.checkpoint.get('history', {})
+        self.best_val_acc = self.checkpoint.get('best_val_acc', None)
+        self.epoch = self.checkpoint.get('epoch', None)
+        
+        # Load model
+        classifier_weight = self.checkpoint['model_state_dict']['classifier.3.weight']
+        num_classes = classifier_weight.shape[0]
+        
+        self.model = EnhancedGlyphCNN(
+            num_classes=num_classes,
+            dropout_rate=self.config.get('dropout_rate', 0.4),
+            use_residual=self.config.get('use_residual', True)
+        )
+        self.model.load_state_dict(self.checkpoint['model_state_dict'])
+        self.model.eval()
+    
+    def count_parameters(self):
+        """Count model parameters."""
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        return {
+            'total': total,
+            'trainable': trainable,
+            'non_trainable': total - trainable
+        }
+    
+    def compute_model_size(self):
+        """Compute model size in MB."""
+        param_size = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in self.model.buffers())
+        size_mb = (param_size + buffer_size) / (1024 ** 2)
+        
+        return size_mb
+    
+    def compute_inference_time(self, input_size=(1, 1, 32, 32), num_runs=100):
+        """Measure average inference time."""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(device)
+        
+        # Warmup
+        dummy_input = torch.randn(input_size).to(device)
+        with torch.no_grad():
+            for _ in range(10):
+                _ = self.model(dummy_input)
+        
+        # Measure
+        times = []
+        with torch.no_grad():
+            for _ in range(num_runs):
+                start = time.time()
+                _ = self.model(dummy_input)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                times.append(time.time() - start)
+        
+        return {
+            'mean_ms': np.mean(times) * 1000,
+            'std_ms': np.std(times) * 1000,
+            'min_ms': np.min(times) * 1000,
+            'max_ms': np.max(times) * 1000
+        }
+    
+    def analyze_layer_sizes(self):
+        """Analyze parameter distribution across layers."""
+        layer_params = OrderedDict()
+        
+        for name, param in self.model.named_parameters():
+            layer_name = name.split('.')[0]
+            if layer_name not in layer_params:
+                layer_params[layer_name] = 0
+            layer_params[layer_name] += param.numel()
+        
+        return layer_params
+    
+    def plot_parameter_distribution(self, save_path=None):
+        """Plot parameter distribution across layers."""
+        layer_params = self.analyze_layer_sizes()
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Bar plot
+        names = list(layer_params.keys())
+        sizes = list(layer_params.values())
+        
+        ax1.bar(range(len(names)), sizes, alpha=0.7, color='steelblue')
+        ax1.set_xticks(range(len(names)))
+        ax1.set_xticklabels(names, rotation=45, ha='right')
+        ax1.set_ylabel('Number of Parameters')
+        ax1.set_title('Parameters per Layer')
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # Pie chart
+        ax2.pie(sizes, labels=names, autopct='%1.1f%%', startangle=90)
+        ax2.set_title('Parameter Distribution')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Parameter distribution plot saved to {save_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def plot_training_history(self, save_path=None):
+        """Plot training history from checkpoint."""
+        if not self.history:
+            print("No training history found in checkpoint")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Loss
+        if 'train_loss' in self.history and 'val_loss' in self.history:
+            ax = axes[0, 0]
+            ax.plot(self.history['train_loss'], label='Train', linewidth=2)
+            ax.plot(self.history['val_loss'], label='Validation', linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Loss')
+            ax.set_title('Training and Validation Loss')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Accuracy
+        if 'train_acc' in self.history and 'val_acc' in self.history:
+            ax = axes[0, 1]
+            ax.plot(self.history['train_acc'], label='Train', linewidth=2)
+            ax.plot(self.history['val_acc'], label='Validation', linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Accuracy (%)')
+            ax.set_title('Training and Validation Accuracy')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Learning rate
+        if 'learning_rates' in self.history:
+            ax = axes[1, 0]
+            ax.plot(self.history['learning_rates'], linewidth=2, color='green')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Learning Rate')
+            ax.set_title('Learning Rate Schedule')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3)
+        
+        # Overfitting analysis
+        if 'train_acc' in self.history and 'val_acc' in self.history:
+            ax = axes[1, 1]
+            gap = np.array(self.history['train_acc']) - np.array(self.history['val_acc'])
+            ax.plot(gap, linewidth=2, color='red')
+            ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            ax.fill_between(range(len(gap)), gap, 0, alpha=0.3, color='red')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Train - Val Accuracy (%)')
+            ax.set_title('Overfitting Gap')
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Training history plot saved to {save_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def generate_report(self):
+        """Generate comprehensive analysis report."""
+        report = []
+        report.append("=" * 70)
+        report.append("MODEL ANALYSIS REPORT")
+        report.append("=" * 70)
+        report.append(f"\nModel: {self.model_path}")
+        
+        # Training info
+        if self.epoch is not None:
+            report.append(f"\nTraining completed at epoch: {self.epoch + 1}")
+        if self.best_val_acc is not None:
+            report.append(f"Best validation accuracy: {self.best_val_acc:.2f}%")
+        
+        # Architecture
+        report.append("\n" + "-" * 70)
+        report.append("ARCHITECTURE")
+        report.append("-" * 70)
+        params = self.count_parameters()
+        report.append(f"Total parameters: {params['total']:,}")
+        report.append(f"Trainable parameters: {params['trainable']:,}")
+        report.append(f"Non-trainable parameters: {params['non_trainable']:,}")
+        
+        model_size = self.compute_model_size()
+        report.append(f"Model size: {model_size:.2f} MB")
+        
+        # Configuration
+        if self.config:
+            report.append("\n" + "-" * 70)
+            report.append("CONFIGURATION")
+            report.append("-" * 70)
+            for key, value in self.config.items():
+                report.append(f"{key}: {value}")
+        
+        # Layer distribution
+        report.append("\n" + "-" * 70)
+        report.append("PARAMETER DISTRIBUTION")
+        report.append("-" * 70)
+        layer_params = self.analyze_layer_sizes()
+        for layer, count in layer_params.items():
+            percentage = (count / params['total']) * 100
+            report.append(f"{layer:20s}: {count:10,} ({percentage:5.1f}%)")
+        
+        # Performance
+        report.append("\n" + "-" * 70)
+        report.append("INFERENCE PERFORMANCE")
+        report.append("-" * 70)
+        inference_time = self.compute_inference_time()
+        report.append(f"Mean inference time: {inference_time['mean_ms']:.3f} ms")
+        report.append(f"Std deviation: {inference_time['std_ms']:.3f} ms")
+        report.append(f"Min: {inference_time['min_ms']:.3f} ms, Max: {inference_time['max_ms']:.3f} ms")
+        
+        throughput = 1000 / inference_time['mean_ms']
+        report.append(f"Estimated throughput: {throughput:.1f} images/second")
+        
+        report.append("\n" + "=" * 70)
+        
+        return "\n".join(report)
+    
+    def export_to_onnx(self, output_path, input_size=(1, 1, 32, 32)):
+        """Export model to ONNX format."""
+        dummy_input = torch.randn(input_size)
+        
+        torch.onnx.export(
+            self.model,
+            dummy_input,
+            output_path,
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+        
+        print(f"Model exported to ONNX: {output_path}")
+        
+        # Verify
+        try:
+            import onnx
+            onnx_model = onnx.load(output_path)
+            onnx.checker.check_model(onnx_model)
+            print("ONNX model verification successful!")
+        except ImportError:
+            print("Install 'onnx' package to verify exported model: pip install onnx")
+        except Exception as e:
+            print(f"ONNX verification failed: {e}")
+
+
+class ModelComparator:
+    """Compare multiple trained models."""
+    
+    def __init__(self, model_paths):
+        self.analyzers = [ModelAnalyzer(path) for path in model_paths]
+        self.model_paths = model_paths
+    
+    def compare_metrics(self):
+        """Compare key metrics across models."""
+        comparison = []
+        
+        for i, analyzer in enumerate(self.analyzers):
+            model_name = Path(self.model_paths[i]).parent.name
+            
+            params = analyzer.count_parameters()
+            size = analyzer.compute_model_size()
+            inference = analyzer.compute_inference_time()
+            
+            comparison.append({
+                'model': model_name,
+                'val_acc': analyzer.best_val_acc,
+                'epoch': analyzer.epoch,
+                'parameters': params['total'],
+                'size_mb': size,
+                'inference_ms': inference['mean_ms'],
+                'throughput': 1000 / inference['mean_ms']
+            })
+        
+        return comparison
+    
+    def plot_comparison(self, save_path=None):
+        """Plot comparison of models."""
+        comparison = self.compare_metrics()
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        model_names = [c['model'] for c in comparison]
+        
+        # Accuracy
+        ax = axes[0, 0]
+        accs = [c['val_acc'] if c['val_acc'] else 0 for c in comparison]
+        bars = ax.bar(range(len(model_names)), accs, alpha=0.7)
+        ax.set_xticks(range(len(model_names)))
+        ax.set_xticklabels(model_names, rotation=45, ha='right')
+        ax.set_ylabel('Validation Accuracy (%)')
+        ax.set_title('Model Accuracy Comparison')
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Color bars by performance
+        best_acc = max(accs)
+        for i, bar in enumerate(bars):
+            if accs[i] == best_acc:
+                bar.set_color('green')
+        
+        # Parameters
+        ax = axes[0, 1]
+        params = [c['parameters'] / 1e6 for c in comparison]  # In millions
+        ax.bar(range(len(model_names)), params, alpha=0.7, color='steelblue')
+        ax.set_xticks(range(len(model_names)))
+        ax.set_xticklabels(model_names, rotation=45, ha='right')
+        ax.set_ylabel('Parameters (Millions)')
+        ax.set_title('Model Size (Parameters)')
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Inference time
+        ax = axes[1, 0]
+        inference_times = [c['inference_ms'] for c in comparison]
+        bars = ax.bar(range(len(model_names)), inference_times, alpha=0.7, color='orange')
+        ax.set_xticks(range(len(model_names)))
+        ax.set_xticklabels(model_names, rotation=45, ha='right')
+        ax.set_ylabel('Inference Time (ms)')
+        ax.set_title('Inference Speed Comparison')
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Color by speed
+        min_time = min(inference_times)
+        for i, bar in enumerate(bars):
+            if inference_times[i] == min_time:
+                bar.set_color('green')
+        
+        # Efficiency (Accuracy per parameter)
+        ax = axes[1, 1]
+        efficiency = [accs[i] / params[i] if params[i] > 0 else 0 
+                     for i in range(len(model_names))]
+        bars = ax.bar(range(len(model_names)), efficiency, alpha=0.7, color='purple')
+        ax.set_xticks(range(len(model_names)))
+        ax.set_xticklabels(model_names, rotation=45, ha='right')
+        ax.set_ylabel('Accuracy / Million Parameters')
+        ax.set_title('Model Efficiency')
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Highlight best
+        best_eff = max(efficiency)
+        for i, bar in enumerate(bars):
+            if efficiency[i] == best_eff:
+                bar.set_color('green')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Comparison plot saved to {save_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def generate_comparison_table(self):
+        """Generate comparison table."""
+        comparison = self.compare_metrics()
+        
+        print("\n" + "=" * 100)
+        print("MODEL COMPARISON TABLE")
+        print("=" * 100)
+        
+        # Header
+        print(f"{'Model':<20} {'Acc(%)':<10} {'Epoch':<8} {'Params(M)':<12} "
+              f"{'Size(MB)':<10} {'Infer(ms)':<12} {'FPS':<10}")
+        print("-" * 100)
+        
+        # Rows
+        for c in comparison:
+            print(f"{c['model']:<20} "
+                  f"{c['val_acc'] if c['val_acc'] else 0:>8.2f}  "
+                  f"{c['epoch'] if c['epoch'] else 0:>6d}  "
+                  f"{c['parameters']/1e6:>10.2f}  "
+                  f"{c['size_mb']:>8.2f}  "
+                  f"{c['inference_ms']:>10.3f}  "
+                  f"{c['throughput']:>8.1f}")
+        
+        print("=" * 100 + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Model Analysis and Comparison Utilities')
+    
+    parser.add_argument('--analyze', type=str,
+                       help='Path to model checkpoint for analysis')
+    parser.add_argument('--compare', type=str, nargs='+',
+                       help='Paths to multiple model checkpoints for comparison')
+    parser.add_argument('--export', type=str,
+                       help='Path to model checkpoint for export')
+    parser.add_argument('--format', type=str, default='onnx',
+                       choices=['onnx'],
+                       help='Export format')
+    parser.add_argument('--output', type=str,
+                       help='Output path for exported model or reports')
+    parser.add_argument('--save-plots', action='store_true',
+                       help='Save plots instead of displaying')
+    
+    args = parser.parse_args()
+    
+    # Single model analysis
+    if args.analyze:
+        print(f"Analyzing model: {args.analyze}\n")
+        analyzer = ModelAnalyzer(args.analyze)
+        
+        # Generate report
+        report = analyzer.generate_report()
+        print(report)
+        
+        if args.output:
+            report_path = args.output if args.output.endswith('.txt') else f"{args.output}_report.txt"
+            with open(report_path, 'w') as f:
+                f.write(report)
+            print(f"\nReport saved to {report_path}")
+        
+        # Generate plots
+        if args.save_plots:
+            base_path = Path(args.analyze).parent
+            analyzer.plot_parameter_distribution(
+                save_path=str(base_path / 'parameter_distribution.png')
+            )
+            analyzer.plot_training_history(
+                save_path=str(base_path / 'training_analysis.png')
+            )
+        else:
+            analyzer.plot_parameter_distribution()
+            analyzer.plot_training_history()
+    
+    # Model comparison
+    elif args.compare:
+        print(f"Comparing {len(args.compare)} models\n")
+        comparator = ModelComparator(args.compare)
+        
+        # Generate comparison table
+        comparator.generate_comparison_table()
+        
+        # Generate comparison plot
+        if args.save_plots and args.output:
+            comparator.plot_comparison(save_path=args.output)
+        else:
+            comparator.plot_comparison()
+    
+    # Model export
+    elif args.export:
+        print(f"Exporting model: {args.export}")
+        analyzer = ModelAnalyzer(args.export)
+        
+        output_path = args.output if args.output else args.export.replace('.pth', '.onnx')
+        
+        if args.format == 'onnx':
+            analyzer.export_to_onnx(output_path)
+    
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
